@@ -1140,10 +1140,14 @@ static int mtk_nfc_probe(struct platform_device *pdev)
 	init_waitqueue_head(&nfc->controller.wq);
 	INIT_LIST_HEAD(&nfc->chips);
 
-	/* probe defer if not ready */
+	/* probe defer if not ready, otherwise leave */
 	nfc->ecc = of_sdg1_ecc_get(np);
 	if (IS_ERR(nfc->ecc))
 		return PTR_ERR(nfc->ecc);
+	if (!nfc->ecc) {
+		dev_err(dev, "no ecc hardware\n");
+		return -EINVAL;
+	}
 
 	nfc->dev = dev;
 
