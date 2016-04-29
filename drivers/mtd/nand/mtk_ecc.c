@@ -211,22 +211,27 @@ static void mtk_ecc_config(struct mtk_ecc *ecc, struct mtk_ecc_config *config)
 	if (config->codec == ECC_ENC) {
 		/* configure ECC encoder (in bits) */
 		enc_sz = config->enc_len << 3;
+
 		reg = ecc_bit | (config->ecc_mode << ECC_MODE_SHIFT);
 		reg |= (enc_sz << ECC_MS_SHIFT);
 		writel(reg, ecc->regs + ECC_ENCCNFG);
+
+		if (config->ecc_mode != ECC_NFI_MODE)
+			writel(lower_32_bits(config->addr),
+				ecc->regs + ECC_ENCDIADDR);
+
 	} else {
 		/* configure ECC decoder (in bits) */
 		dec_sz = config->dec_len;
+
 		reg = ecc_bit | (config->ecc_mode << ECC_MODE_SHIFT);
 		reg |= (dec_sz << ECC_MS_SHIFT) | DEC_CNFG_CORRECT;
 		reg |= DEC_EMPTY_EN;
 		writel(reg, ecc->regs + ECC_DECCNFG);
+
 		if (config->sec_mask)
 			ecc->sec_mask = 1 << (config->sec_mask - 1);
 	}
-
-	if (config->ecc_mode != ECC_NFI_MODE)
-		writel(lower_32_bits(config->addr), ecc->regs + ECC_ENCDIADDR);
 }
 
 void mtk_ecc_get_stats(struct mtk_ecc *ecc, struct mtk_ecc_stats *stats,

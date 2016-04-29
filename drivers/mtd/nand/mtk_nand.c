@@ -119,6 +119,9 @@ struct mtk_nfc_bad_mark_ctl {
 	u32 pos;
 };
 
+/*
+ * FDM: region used to store free OOB data
+ */
 struct mtk_nfc_fdm {
 	u32 reg_size;
 	u32 ecc_size;
@@ -1108,12 +1111,15 @@ static int mtk_nfc_ecc_init(struct device *dev, struct mtd_info *mtd)
 		return -EINVAL;
 	}
 
-	/* if optional dt settings not present */
+	/* if optional DT settings are not present */
 	if (!nand->ecc.size || !nand->ecc.strength) {
-		/* this controller just supports 512 and 1024 */
+
+		/* controller only supports sizes 512 and 1024 */
 		nand->ecc.size = (mtd->writesize > 512) ? 1024 : 512;
+
+		/* get controller valid values */
 		mtk_nfc_set_spare_per_sector(&spare, mtd);
-		spare -= NFI_FDM_MAX_SIZE;
+		spare = spare - NFI_FDM_MAX_SIZE;
 		nand->ecc.strength = (spare << 3) / ECC_PARITY_BITS;
 	}
 

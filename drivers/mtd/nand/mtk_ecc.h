@@ -40,10 +40,8 @@ struct mtk_ecc_config {
 
 int mtk_ecc_enable(struct mtk_ecc *, struct mtk_ecc_config *);
 void mtk_ecc_disable(struct mtk_ecc *, struct mtk_ecc_config *);
-
 int mtk_ecc_encode_non_nfi_mode(struct mtk_ecc *, struct mtk_ecc_config *,
 				u8 *, u32);
-
 void mtk_ecc_get_stats(struct mtk_ecc *, struct mtk_ecc_stats *, int);
 int mtk_ecc_wait_irq_done(struct mtk_ecc *, enum mtk_ecc_codec);
 void mtk_ecc_hw_init(struct mtk_ecc *);
