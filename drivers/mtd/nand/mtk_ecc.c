@@ -22,13 +22,16 @@
 #include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
-#include <linux/semaphore.h>
+#include <linux/mutex.h>
 
 #include "mtk_ecc.h"
 
+#define ECC_IDLE_MASK		BIT(0)
+#define ECC_IRQ_EN		BIT(0)
+#define ECC_CODEC_ENABLE	(1)
+#define ECC_CODEC_DISABLE	(0)
+
 #define ECC_ENCCON		(0x00)
-#define		ENC_EN			(1)
-#define		ENC_DE			(0)
 #define ECC_ENCCNFG		(0x04)
 #define		ECC_CNFG_4BIT		(0)
 #define		ECC_CNFG_6BIT		(1)
@@ -54,35 +57,26 @@
 #define		ECC_MS_SHIFT		(16)
 #define ECC_ENCDIADDR		(0x08)
 #define ECC_ENCIDLE		(0x0C)
-#define		ENC_IDLE		BIT(0)
 #define ECC_ENCPAR(x)		(0x10 + (x) * sizeof(u32))
 #define ECC_ENCIRQ_EN		(0x80)
-#define		ENC_IRQEN		BIT(0)
 #define ECC_ENCIRQ_STA		(0x84)
 #define ECC_DECCON		(0x100)
-#define		DEC_EN			(1)
-#define		DEC_DE			(0)
 #define ECC_DECCNFG		(0x104)
 #define		DEC_EMPTY_EN		BIT(31)
 #define		DEC_CNFG_CORRECT	(0x3 << 12)
 #define ECC_DECIDLE		(0x10C)
-#define		DEC_IDLE		BIT(0)
 #define ECC_DECENUM0		(0x114)
 #define		ERR_MASK		(0x3f)
 #define ECC_DECDONE		(0x124)
 #define ECC_DECIRQ_EN		(0x200)
-#define		DEC_IRQEN		BIT(0)
 #define ECC_DECIRQ_STA		(0x204)
 
 #define ECC_TIMEOUT		(500000)
 
-#define ECC_IDLE_REG(x)		((x) == ECC_ENC ? ECC_ENCIDLE : ECC_DECIDLE)
-#define ECC_IDLE_MASK(x)	((x) == ECC_ENC ? ENC_IDLE : DEC_IDLE)
-#define ECC_IRQ_REG(x)		((x) == ECC_ENC ? ECC_ENCIRQ_EN : ECC_DECIRQ_EN)
-#define ECC_IRQ_EN(x)		((x) == ECC_ENC ? ENC_IRQEN : DEC_IRQEN)
-#define ECC_CTL_REG(x)		((x) == ECC_ENC ? ECC_ENCCON : ECC_DECCON)
-#define ECC_CODEC_ENABLE(x)	((x) == ECC_ENC ? ENC_EN : DEC_EN)
-#define ECC_CODEC_DISABLE(x)	((x) == ECC_ENC ? ENC_DE : DEC_DE)
+#define ECC_IDLE_REG(op)	((op) == ECC_ENCODE ? ECC_ENCIDLE : ECC_DECIDLE)
+#define ECC_CTL_REG(op)		((op) == ECC_ENCODE ? ECC_ENCCON : ECC_DECCON)
+#define ECC_IRQ_REG(op)		((op) == ECC_ENCODE ? \
+					ECC_ENCIRQ_EN : ECC_DECIRQ_EN)
 
 struct mtk_ecc {
 	struct device *dev;
@@ -90,50 +84,50 @@ struct mtk_ecc {
 	struct clk *clk;
 
 	struct completion done;
-	struct semaphore sem;
-	u32 sec_mask;
+	struct mutex lock;
+	u32 sectors;
 };
 
-static inline void mtk_ecc_codec_wait_idle(struct mtk_ecc *ecc,
-					enum mtk_ecc_codec codec)
+static inline void mtk_ecc_wait_idle(struct mtk_ecc *ecc,
+					enum mtk_ecc_operation op)
 {
 	struct device *dev = ecc->dev;
 	u32 val;
 	int ret;
 
-	ret = readl_poll_timeout_atomic(ecc->regs + ECC_IDLE_REG(codec), val,
-					val & ECC_IDLE_MASK(codec),
+	ret = readl_poll_timeout_atomic(ecc->regs + ECC_IDLE_REG(op), val,
+					val & ECC_IDLE_MASK,
 					10, ECC_TIMEOUT);
 	if (ret)
 		dev_warn(dev, "%s NOT idle\n",
-			codec == ECC_ENC ? "encoder" : "decoder");
+			op == ECC_ENCODE ? "encoder" : "decoder");
 }
 
 static irqreturn_t mtk_ecc_irq(int irq, void *id)
 {
 	struct mtk_ecc *ecc = id;
-	enum mtk_ecc_codec codec;
+	enum mtk_ecc_operation op;
 	u32 dec, enc;
 
-	dec = readw(ecc->regs + ECC_DECIRQ_STA) & DEC_IRQEN;
+	dec = readw(ecc->regs + ECC_DECIRQ_STA) & ECC_IRQ_EN;
 	if (dec) {
-		codec = ECC_DEC;
+		op = ECC_DECODE;
 		dec = readw(ecc->regs + ECC_DECDONE);
-		if (dec & ecc->sec_mask) {
-			ecc->sec_mask = 0;
+		if (dec & ecc->sectors) {
+			ecc->sectors = 0;
 			complete(&ecc->done);
 		} else
 			return IRQ_HANDLED;
 	} else {
-		enc = readl(ecc->regs + ECC_ENCIRQ_STA) & ENC_IRQEN;
+		enc = readl(ecc->regs + ECC_ENCIRQ_STA) & ECC_IRQ_EN;
 		if (enc) {
-			codec = ECC_ENC;
+			op = ECC_ENCODE;
 			complete(&ecc->done);
 		} else
 			return IRQ_NONE;
 	}
 
-	writel(0, ecc->regs + ECC_IRQ_REG(codec));
+	writel(0, ecc->regs + ECC_IRQ_REG(op));
 
 	return IRQ_HANDLED;
 }
@@ -208,29 +202,30 @@ static void mtk_ecc_config(struct mtk_ecc *ecc, struct mtk_ecc_config *config)
 		dev_err(ecc->dev, "invalid strength %d\n", config->strength);
 	}
 
-	if (config->codec == ECC_ENC) {
+	if (config->op == ECC_ENCODE) {
 		/* configure ECC encoder (in bits) */
-		enc_sz = config->enc_len << 3;
+		enc_sz = config->len << 3;
 
-		reg = ecc_bit | (config->ecc_mode << ECC_MODE_SHIFT);
+		reg = ecc_bit | (config->mode << ECC_MODE_SHIFT);
 		reg |= (enc_sz << ECC_MS_SHIFT);
 		writel(reg, ecc->regs + ECC_ENCCNFG);
 
-		if (config->ecc_mode != ECC_NFI_MODE)
+		if (config->mode != ECC_NFI_MODE)
 			writel(lower_32_bits(config->addr),
 				ecc->regs + ECC_ENCDIADDR);
 
 	} else {
 		/* configure ECC decoder (in bits) */
-		dec_sz = config->dec_len;
+		dec_sz = (config->len << 3) +
+					config->strength * ECC_PARITY_BITS;
 
-		reg = ecc_bit | (config->ecc_mode << ECC_MODE_SHIFT);
+		reg = ecc_bit | (config->mode << ECC_MODE_SHIFT);
 		reg |= (dec_sz << ECC_MS_SHIFT) | DEC_CNFG_CORRECT;
 		reg |= DEC_EMPTY_EN;
 		writel(reg, ecc->regs + ECC_DECCNFG);
 
-		if (config->sec_mask)
-			ecc->sec_mask = 1 << (config->sec_mask - 1);
+		if (config->sectors)
+			ecc->sectors = 1 << (config->sectors - 1);
 	}
 }
 
@@ -269,6 +264,15 @@ void mtk_ecc_release(struct mtk_ecc *ecc)
 }
 EXPORT_SYMBOL(mtk_ecc_release);
 
+static void mtk_ecc_hw_init(struct mtk_ecc *ecc)
+{
+	mtk_ecc_wait_idle(ecc, ECC_ENCODE);
+	writew(ECC_CODEC_DISABLE, ecc->regs + ECC_ENCCON);
+
+	mtk_ecc_wait_idle(ecc, ECC_DECODE);
+	writel(ECC_CODEC_DISABLE, ecc->regs + ECC_DECCON);
+}
+
 static struct mtk_ecc *mtk_ecc_get(struct device_node *np)
 {
 	struct platform_device *pdev;
@@ -303,54 +307,60 @@ EXPORT_SYMBOL(of_mtk_ecc_get);
 
 int mtk_ecc_enable(struct mtk_ecc *ecc, struct mtk_ecc_config *config)
 {
-	enum mtk_ecc_codec codec = config->codec;
+	enum mtk_ecc_operation op = config->op;
 	int ret;
 
-	ret = down_interruptible(&ecc->sem);
+	ret = mutex_lock_interruptible(&ecc->lock);
 	if (ret) {
 		dev_err(ecc->dev, "interrupted when attempting to lock\n");
 		return ret;
 	}
 
-	mtk_ecc_codec_wait_idle(ecc, codec);
+	mtk_ecc_wait_idle(ecc, op);
 	mtk_ecc_config(ecc, config);
-	writew(ECC_CODEC_ENABLE(codec), ecc->regs + ECC_CTL_REG(codec));
+	writew(ECC_CODEC_ENABLE, ecc->regs + ECC_CTL_REG(op));
 
 	init_completion(&ecc->done);
-	writew(ECC_IRQ_EN(codec), ecc->regs + ECC_IRQ_REG(codec));
+	writew(ECC_IRQ_EN, ecc->regs + ECC_IRQ_REG(op));
 
 	return 0;
 }
 EXPORT_SYMBOL(mtk_ecc_enable);
 
-void mtk_ecc_disable(struct mtk_ecc *ecc, struct mtk_ecc_config *config)
+void mtk_ecc_disable(struct mtk_ecc *ecc)
 {
-	enum mtk_ecc_codec codec = config->codec;
+	enum mtk_ecc_operation op = ECC_ENCODE;
 
-	mtk_ecc_codec_wait_idle(ecc, codec);
-	writew(0, ecc->regs + ECC_IRQ_REG(codec));
-	writew(ECC_CODEC_DISABLE(codec), ecc->regs + ECC_CTL_REG(codec));
-	up(&ecc->sem);
+	/* find out the running operation */
+	if  (readw(ecc->regs + ECC_CTL_REG(op)) != ECC_CODEC_ENABLE)
+	     op = ECC_DECODE;
+
+	/* disable it */
+	mtk_ecc_wait_idle(ecc, op);
+	writew(0, ecc->regs + ECC_IRQ_REG(op));
+	writew(ECC_CODEC_DISABLE, ecc->regs + ECC_CTL_REG(op));
+
+	mutex_unlock(&ecc->lock);
 }
 EXPORT_SYMBOL(mtk_ecc_disable);
 
-int mtk_ecc_wait_irq_done(struct mtk_ecc *ecc, enum mtk_ecc_codec codec)
+int mtk_ecc_wait_done(struct mtk_ecc *ecc, enum mtk_ecc_operation op)
 {
 	int ret;
 
 	ret = wait_for_completion_timeout(&ecc->done, msecs_to_jiffies(500));
 	if (!ret) {
 		dev_err(ecc->dev, "%s timeout - interrupt did not arrive)\n",
-				(codec == ECC_ENC) ? "encoder" : "decoder");
+				(op == ECC_ENCODE) ? "encoder" : "decoder");
 		return -ETIMEDOUT;
 	}
 
 	return 0;
 }
-EXPORT_SYMBOL(mtk_ecc_wait_irq_done);
+EXPORT_SYMBOL(mtk_ecc_wait_done);
 
-int mtk_ecc_encode_non_nfi_mode(struct mtk_ecc *ecc,
-			struct mtk_ecc_config *config, u8 *data, u32 bytes)
+int mtk_ecc_encode(struct mtk_ecc *ecc, struct mtk_ecc_config *config,
+			u8 *data, u32 bytes)
 {
 	dma_addr_t addr;
 	u32 *p, len, i;
@@ -363,7 +373,7 @@ int mtk_ecc_encode_non_nfi_mode(struct mtk_ecc *ecc,
 		return -EINVAL;
 	}
 
-	config->codec = ECC_ENC;
+	config->op = ECC_ENCODE;
 	config->addr = addr;
 	ret = mtk_ecc_enable(ecc, config);
 	if (ret) {
@@ -371,11 +381,11 @@ int mtk_ecc_encode_non_nfi_mode(struct mtk_ecc *ecc,
 		return ret;
 	}
 
-	ret = mtk_ecc_wait_irq_done(ecc, ECC_ENC);
+	ret = mtk_ecc_wait_done(ecc, ECC_ENCODE);
 	if (ret)
 		goto timeout;
 
-	mtk_ecc_codec_wait_idle(ecc, ECC_ENC);
+	mtk_ecc_wait_idle(ecc, ECC_ENCODE);
 
 	/* Program ECC bytes to OOB: per sector oob = FDM + ECC + SPARE */
 	len = (config->strength * ECC_PARITY_BITS + 7) >> 3;
@@ -387,22 +397,13 @@ int mtk_ecc_encode_non_nfi_mode(struct mtk_ecc *ecc,
 timeout:
 
 	dma_unmap_single(ecc->dev, addr, bytes, DMA_TO_DEVICE);
-	mtk_ecc_disable(ecc, config);
+	mtk_ecc_disable(ecc);
 
 	return ret;
 }
-EXPORT_SYMBOL(mtk_ecc_encode_non_nfi_mode);
+EXPORT_SYMBOL(mtk_ecc_encode);
 
-void mtk_ecc_hw_init(struct mtk_ecc *ecc)
-{
-	mtk_ecc_codec_wait_idle(ecc, ECC_ENC);
-	writew(ENC_DE, ecc->regs + ECC_ENCCON);
-
-	mtk_ecc_codec_wait_idle(ecc, ECC_DEC);
-	writel(DEC_DE, ecc->regs + ECC_DECCON);
-}
-
-void mtk_ecc_update_strength(u32 *p)
+void mtk_ecc_adjust_strength(u32 *p)
 {
 	u32 ecc[] = {4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36,
 			40, 44, 48, 52, 56, 60};
@@ -420,7 +421,7 @@ void mtk_ecc_update_strength(u32 *p)
 
 	*p = ecc[ARRAY_SIZE(ecc) - 1];
 }
-EXPORT_SYMBOL(mtk_ecc_update_strength);
+EXPORT_SYMBOL(mtk_ecc_adjust_strength);
 
 static int mtk_ecc_probe(struct platform_device *pdev)
 {
@@ -465,7 +466,7 @@ static int mtk_ecc_probe(struct platform_device *pdev)
 	}
 
 	ecc->dev = dev;
-	sema_init(&ecc->sem, 1);
+	mutex_init(&ecc->lock);
 	platform_set_drvdata(pdev, ecc);
 	dev_info(dev, "probed\n");
 
@@ -522,6 +523,5 @@ static struct platform_driver mtk_ecc_driver = {
 module_platform_driver(mtk_ecc_driver);
 
 MODULE_AUTHOR("Xiaolei Li <xiaolei.li@mediatek.com>");
-MODULE_AUTHOR("Jorge Ramirez-Ortiz <jorge.ramirez-ortiz@linaro.org>");
 MODULE_DESCRIPTION("MTK Nand ECC Driver");
 MODULE_LICENSE("GPL");
